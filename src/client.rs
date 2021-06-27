@@ -14,7 +14,7 @@ use super::rollsum;
 use super::sendlog;
 use super::xid::*;
 use super::xtar;
-use std::cell::{Cell, RefCell};
+use std::{cell::{Cell, RefCell}, fs::DirEntry};
 use std::collections::{BTreeMap, HashMap};
 use std::convert::TryInto;
 use std::os::unix::ffi::OsStrExt;
@@ -387,29 +387,48 @@ impl<'a, 'b, 'c> SendSession<'a, 'b, 'c> {
                 )
             });
 
-            let mut index_ents = Vec::new();
-
-            'collect_dir_ents: for entry in dir_ents {
+            // Calls `stat()` on a directory entry.
+            let stat_dirent = |entry: DirEntry| -> Result<Option<(DirEntry, std::fs::Metadata)>, anyhow::Error> {
                 let ent_path = entry.path();
 
+                // Check if file is excluded.
                 for excl in exclusions {
                     if excl.matches_path(&ent_path) {
-                        continue 'collect_dir_ents;
+                        return Ok(None)
                     }
                 }
 
-                let metadata = match entry.metadata() {
-                    Ok(metadata) => metadata,
+                // Perform the stat.
+                match entry.metadata() {
+                    Ok(metadata) => return Ok(Some((entry, metadata))),
                     // If the entry was deleted from under us, treat it as if it was excluded.
-                    Err(err) if likely_smear_error(&err) => continue 'collect_dir_ents,
+                    Err(err) if likely_smear_error(&err) => return Ok(None),
                     Err(err) => anyhow::bail!(
                         "unable to fetch metadata for {}: {}",
                         ent_path.display(),
-                        err
-                    ),
+                        err),
                 };
+            };
 
-                // There is no meaningful way to backup a unix socket.
+            // Do statting ahead of collecting, so that we can parallelise
+            // it in the future.
+            // On Linux, there is no asynchronous variant of the `stat()`
+            // syscall (except `io_uring`), so threads need to be used.
+            let dir_ents_with_metadata: Vec<(DirEntry, std::fs::Metadata)> =
+                dir_ents
+                .into_iter() // TODO: Am I doing this right, will the `DirEntry`s be copied or not (I wish they won't)?
+                .map(stat_dirent)
+                // TODO: Is there a more efficient way to turn <Result<Option<_>> into eventually just <_>?
+                .collect::<Result<Vec<_>,_>>()? // early-fail on error to fetch metadata
+                .into_iter()
+                .flatten()
+                .collect();
+
+            let mut index_ents = Vec::new();
+
+            'collect_dir_ents: for (entry, metadata) in dir_ents_with_metadata {
+                let ent_path = entry.path();
+
                 if metadata.file_type().is_socket() {
                     continue 'collect_dir_ents;
                 }

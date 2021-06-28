@@ -14,7 +14,7 @@ use super::rollsum;
 use super::sendlog;
 use super::xid::*;
 use super::xtar;
-use std::{cell::{Cell, RefCell}, fs::DirEntry, sync::Arc};
+use std::{cell::{Cell, RefCell}, fs::DirEntry, path::PathBuf, sync::Arc};
 use std::collections::{BTreeMap, HashMap};
 use std::convert::TryInto;
 use std::os::unix::ffi::OsStrExt;
@@ -540,7 +540,7 @@ impl<'a, 'b, 'c> SendSession<'a, 'b, 'c> {
                     let dir_data_chunk_idx =
                         self.data_tw.get_mut().as_ref().unwrap().data_chunk_count();
 
-                    'add_dir_ents: for (ent_path, mut index_ent) in index_ents.drain(..) {
+                    let process_entry = |(ent_path, mut index_ent): (PathBuf, index::IndexEntry)| -> Result<(), anyhow::Error> {
                         let ent_data_chunk_idx =
                             self.data_tw.get_mut().as_ref().unwrap().data_chunk_count();
                         let ent_data_chunk_offset = self.data_chunker.buffered_count() as u64;
@@ -557,7 +557,7 @@ impl<'a, 'b, 'c> SendSession<'a, 'b, 'c> {
                                     // or the filesystem was unmounted during upload.
                                     // We simply skip this entry but don't cache the result.
                                     smear_detected = true;
-                                    continue 'add_dir_ents;
+                                    return Ok(());
                                 }
                                 Err(err) => {
                                     anyhow::bail!("unable to read {}: {}", ent_path.display(), err)
@@ -599,8 +599,13 @@ impl<'a, 'b, 'c> SendSession<'a, 'b, 'c> {
                         index_ent.offsets.data_chunk_idx.0 += dir_data_chunk_idx;
                         index_ent.offsets.data_chunk_end_idx.0 += dir_data_chunk_idx;
 
-                        self.write_idx_ent(&index::VersionedIndexEntry::V2(index_ent))?;
-                    }
+                        self.write_idx_ent(&index::VersionedIndexEntry::V2(index_ent))
+                    };
+
+                    // Process entries.
+                    index_ents.into_iter()
+                        .map(process_entry)
+                        .collect::<Result<(), anyhow::Error>>()?;
 
                     if let Some(boundary_chunk) = self.data_chunker.force_split() {
                         let boundary_chunk_len = boundary_chunk.len();

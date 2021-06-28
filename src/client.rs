@@ -14,13 +14,14 @@ use super::rollsum;
 use super::sendlog;
 use super::xid::*;
 use super::xtar;
-use std::{cell::{Cell, RefCell}, fs::DirEntry};
+use std::{cell::{Cell, RefCell}, fs::DirEntry, sync::Arc};
 use std::collections::{BTreeMap, HashMap};
 use std::convert::TryInto;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
+use pipeliner::Pipeline;
 
 cfg_if::cfg_if! {
     if #[cfg(target_os = "linux")] {
@@ -387,12 +388,19 @@ impl<'a, 'b, 'c> SendSession<'a, 'b, 'c> {
                 )
             });
 
+            // Each thread needs their own exclusions, because `pipeliner`
+            // `with_threads()` requires static lifetimes.
+            // TODO: Check if that explanation is correct, and whether the below copying code cannot be made much easier.
+            let mut exclusions_copied = Vec::new();
+            exclusions_copied.clone_from_slice(exclusions);
+            let exclusions_arc: Arc<Vec<glob::Pattern>> = Arc::new(exclusions_copied);
+
             // Calls `stat()` on a directory entry.
-            let stat_dirent = |entry: DirEntry| -> Result<Option<(DirEntry, std::fs::Metadata)>, anyhow::Error> {
+            let stat_dirent = move |entry: DirEntry| -> Result<Option<(DirEntry, std::fs::Metadata)>, anyhow::Error> {
                 let ent_path = entry.path();
 
                 // Check if file is excluded.
-                for excl in exclusions {
+                for excl in exclusions_arc.iter() {
                     if excl.matches_path(&ent_path) {
                         return Ok(None)
                     }
@@ -410,13 +418,14 @@ impl<'a, 'b, 'c> SendSession<'a, 'b, 'c> {
                 };
             };
 
-            // Do statting ahead of collecting, so that we can parallelise
-            // it in the future.
+            // Do statting in parallel.
             // On Linux, there is no asynchronous variant of the `stat()`
             // syscall (except `io_uring`), so threads need to be used.
             let dir_ents_with_metadata: Vec<(DirEntry, std::fs::Metadata)> =
                 dir_ents
                 .into_iter() // TODO: Am I doing this right, will the `DirEntry`s be copied or not (I wish they won't)?
+                // TODO: Figure out why `pipeliner` spams `thread_yield()` syscall.
+                .with_threads(100)
                 .map(stat_dirent)
                 // TODO: Is there a more efficient way to turn <Result<Option<_>> into eventually just <_>?
                 .collect::<Result<Vec<_>,_>>()? // early-fail on error to fetch metadata

@@ -14,14 +14,18 @@ use super::rollsum;
 use super::sendlog;
 use super::xid::*;
 use super::xtar;
-use std::{cell::{Cell, RefCell}, fs::DirEntry, sync::Arc};
+use pipeliner::Pipeline;
 use std::collections::{BTreeMap, HashMap};
 use std::convert::TryInto;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
-use pipeliner::Pipeline;
+use std::{
+    cell::{Cell, RefCell},
+    fs::DirEntry,
+    sync::Arc,
+};
 
 cfg_if::cfg_if! {
     if #[cfg(target_os = "linux")] {
@@ -392,42 +396,40 @@ impl<'a, 'b, 'c> SendSession<'a, 'b, 'c> {
             let exclusions = exclusions.clone();
 
             // Calls `stat()` on a directory entry.
-            let stat_dirent = move |entry: DirEntry| -> Result<Option<(DirEntry, std::fs::Metadata)>, anyhow::Error> {
-                let ent_path = entry.path();
+            let stat_dirent =
+                move |entry: DirEntry| -> Option<anyhow::Result<(DirEntry, std::fs::Metadata)>> {
+                    let ent_path = entry.path();
 
-                // Check if file is excluded.
-                for excl in exclusions.iter() {
-                    if excl.matches_path(&ent_path) {
-                        return Ok(None)
+                    // Check if file is excluded.
+                    for excl in exclusions.iter() {
+                        if excl.matches_path(&ent_path) {
+                            return None;
+                        }
                     }
-                }
 
-                // Perform the stat.
-                match entry.metadata() {
-                    Ok(metadata) => return Ok(Some((entry, metadata))),
-                    // If the entry was deleted from under us, treat it as if it was excluded.
-                    Err(err) if likely_smear_error(&err) => return Ok(None),
-                    Err(err) => anyhow::bail!(
-                        "unable to fetch metadata for {}: {}",
-                        ent_path.display(),
-                        err),
+                    // Perform the stat.
+                    match entry.metadata() {
+                        Ok(metadata) => Some(Ok((entry, metadata))),
+                        // If the entry was deleted from under us, treat it as if it was excluded.
+                        Err(err) if likely_smear_error(&err) => None,
+                        Err(err) => Some(Err(anyhow::anyhow!(
+                            "unable to fetch metadata for {}: {}",
+                            ent_path.display(),
+                            err
+                        ))),
+                    }
                 };
-            };
 
             // Do statting in parallel.
             // On Linux, there is no asynchronous variant of the `stat()`
             // syscall (except `io_uring`), so threads need to be used.
-            let dir_ents_with_metadata: Vec<(DirEntry, std::fs::Metadata)> =
-                dir_ents
-                .into_iter() // TODO: Am I doing this right, will the `DirEntry`s be copied or not (I wish they won't)?
+            let dir_ents_with_metadata: Vec<(DirEntry, std::fs::Metadata)> = dir_ents
+                .into_iter() // We need to move the data into the `stat_dirent` closure.
                 // TODO: Figure out why `pipeliner` spams `thread_yield()` syscall.
                 .with_threads(100)
                 .map(stat_dirent)
-                // TODO: Is there a more efficient way to turn <Result<Option<_>> into eventually just <_>?
-                .collect::<Result<Vec<_>,_>>()? // early-fail on error to fetch metadata
-                .into_iter()
                 .flatten()
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?;
 
             let mut index_ents = Vec::new();
 

@@ -288,7 +288,7 @@ impl<'a, 'b, 'c> SendSession<'a, 'b, 'c> {
         &mut self,
         base: &std::path::Path,
         paths: &[std::path::PathBuf],
-        exclusions: &[glob::Pattern],
+        exclusions: &Arc<[glob::Pattern]>,
     ) -> Result<(), anyhow::Error> {
         let use_stat_cache = self.ctx.use_stat_cache;
 
@@ -388,19 +388,15 @@ impl<'a, 'b, 'c> SendSession<'a, 'b, 'c> {
                 )
             });
 
-            // Each thread needs their own exclusions, because `pipeliner`
-            // `with_threads()` requires static lifetimes.
-            // TODO: Check if that explanation is correct, and whether the below copying code cannot be made much easier.
-            let mut exclusions_copied = Vec::new();
-            exclusions_copied.clone_from_slice(exclusions);
-            let exclusions_arc: Arc<Vec<glob::Pattern>> = Arc::new(exclusions_copied);
+            // Cloned `Arc` that we can use from our static `stat_dirent` closure.
+            let exclusions = exclusions.clone();
 
             // Calls `stat()` on a directory entry.
             let stat_dirent = move |entry: DirEntry| -> Result<Option<(DirEntry, std::fs::Metadata)>, anyhow::Error> {
                 let ent_path = entry.path();
 
                 // Check if file is excluded.
-                for excl in exclusions_arc.iter() {
+                for excl in exclusions.iter() {
                     if excl.matches_path(&ent_path) {
                         return Ok(None)
                     }
@@ -718,7 +714,7 @@ pub enum DataSource {
     Filesystem {
         base: std::path::PathBuf,
         paths: Vec<std::path::PathBuf>,
-        exclusions: Vec<glob::Pattern>,
+        exclusions: Arc<[glob::Pattern]>,
     },
 }
 
